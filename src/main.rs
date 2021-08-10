@@ -1,9 +1,10 @@
-#![deny(warnings)]
+// #![deny(warnings)]
 
 /// Initial implementation taken from [Hyper's own examples][1]. MIT Licensed.
 ///
 /// [1]: https://github.com/hyperium/hyper/blob/684f2fa76d44fa2b1b063ad0443a1b0d16dfad0e/examples/http_proxy.rs
 use std::convert::Infallible;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 
 use hyper::service::{make_service_fn, service_fn};
@@ -21,9 +22,21 @@ type HttpClient = Client<hyper::client::HttpConnector>;
 //    $ export https_proxy=http://127.0.0.1:8100
 // 3. send requests
 //    $ curl -i https://www.some_domain.com/
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
   let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
+  let internal_addr = SocketAddr::from(([127, 0, 0, 1], 8101));
+
+  let router = internal_router();
+  let service = routerify::RouterService::new(router).unwrap();
+  let server = Server::bind(&internal_addr).serve(service);
+  println!("Internal server is running on: {}", internal_addr);
+
+  tokio::spawn(async move {
+    if let Err(err) = server.await {
+      eprintln!("Server error: {}", err);
+    }
+  });
 
   let client = Client::builder()
     .http1_title_case_headers(true)
@@ -96,7 +109,7 @@ async fn proxy(
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
-  uri.authority().and_then(|auth| Some(auth.to_string()))
+  uri.authority().map(|auth| auth.to_string())
 }
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
@@ -105,19 +118,31 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
   // Connect to remote server
   let mut server = TcpStream::connect(addr).await?;
 
-  //   println!("connection established");
-
   // Proxying data
-  let (from_client, from_server) =
-    tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
-
-  //   println!("data copied");
-
-  // Print message when done
-  println!(
-    "client wrote {} bytes and received {} bytes",
-    from_client, from_server
-  );
+  match tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
+    Ok((from_client, from_server)) => {
+      // Print message when done
+      println!(
+        "client wrote {} bytes and received {} bytes",
+        from_client, from_server
+      );
+    }
+    Err(e) => {
+      // not connected error are harmless, so we're simply ignoring them here,
+      // returning any other kind of errors.
+      if e.kind() != ErrorKind::NotConnected {
+        return Err(e);
+      }
+    }
+  }
 
   Ok(())
+}
+
+fn internal_router() -> routerify::Router<Body, Infallible> {
+  let builder = routerify::Router::<Body, Infallible>::builder()
+    .get("/metrics", |_| async move {
+      Ok(Response::new(Body::from("OK")))
+    });
+  builder.build().unwrap()
 }

@@ -10,8 +10,19 @@ use std::net::SocketAddr;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{http, Body, Client, Method, Request, Response, Server};
-
+use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use tokio::net::TcpStream;
+
+lazy_static::lazy_static! {
+  static ref INGRESS_BYTES: IntCounter = register_int_counter!(
+    "proxy_ingress_bytes_total",
+    "A Counter for the total number of bytes ingested by the HTTP proxy"
+  ).unwrap();
+  static ref EGRESS_BYTES: IntCounter = register_int_counter!(
+    "proxy_egress_bytes_total",
+    "A Counter for the total number of bytes sent by the HTTP proxy"
+  ).unwrap();
+}
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -126,6 +137,8 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
         "client wrote {} bytes and received {} bytes",
         from_client, from_server
       );
+      EGRESS_BYTES.inc_by(from_client);
+      INGRESS_BYTES.inc_by(from_server);
     }
     Err(e) => {
       // not connected error are harmless, so we're simply ignoring them here,
@@ -140,9 +153,17 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
 }
 
 fn internal_router() -> routerify::Router<Body, Infallible> {
-  let builder = routerify::Router::<Body, Infallible>::builder()
-    .get("/metrics", |_| async move {
-      Ok(Response::new(Body::from("OK")))
-    });
+  let builder =
+    routerify::Router::<Body, Infallible>::builder().get("/metrics", metrics);
   builder.build().unwrap()
+}
+
+async fn metrics(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
+  let mut buffer = Vec::new();
+  let encoder = TextEncoder::new();
+  // Gather the metrics.
+  let metric_families = prometheus::gather();
+  // Encode them to send.
+  encoder.encode(&metric_families, &mut buffer).unwrap();
+  Ok(Response::new(buffer.into()))
 }
